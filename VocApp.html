@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vocabulary App</title>
+    <!-- Use Tailwind CSS for a clean, mobile-first design -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+      body {
+        font-family: 'Inter', sans-serif;
+      }
+    </style>
+</head>
+<body class="bg-gray-900 text-gray-100 p-2 sm:p-4">
+
+    <div class="max-w-md mx-auto my-4 sm:my-8 p-4 sm:p-6 bg-gray-800 rounded-xl shadow-lg">
+        <h1 class="text-2xl sm:text-3xl font-bold text-center mb-4 sm:mb-6 text-transparent bg-clip-text bg-gradient-to-r from-teal-400 to-blue-500">
+            Vocabulary Builder
+        </h1>
+
+        <p class="text-center text-gray-400 text-sm sm:text-base mb-4 sm:mb-6">
+            Select a month and week, then click a word to hear it and its spelling.
+        </p>
+        
+        <!-- Controls section with dropdowns and a button -->
+        <div class="flex flex-col gap-3 sm:gap-4 mb-4 sm:mb-6">
+            <select id="month-select" class="w-full p-2 sm:p-3 bg-gray-700 rounded-lg border border-gray-600 text-gray-100 text-sm sm:text-base focus:outline-none focus:ring-2 focus:ring-teal-500">
+                <option value="January">January</option>
+                <option value="February">February</option>
+                <option value="March">March</option>
+                <option value="April">April</option>
+                <option value="May">May</option>
+                <option value="June">June</option>
+                <option value="July">July</option>
+                <option value="August">August</option>
+                <option value="September">September</option>
+                <option value="October">October</option>
+                <option value="November">November</option>
+                <option value="December">December</option>
+            </select>
+
+            <select id="week-select" class="w-full p-2 sm:p-3 bg-gray-700 rounded-lg border border-gray-600 text-gray-100 text-sm sm:text-base focus:outline-none focus:ring-2 focus:ring-teal-500">
+                <option value="1">Week 1</option>
+                <option value="2">Week 2</option>
+                <option value="3">Week 3</option>
+                <option value="4">Week 4</option>
+                <option value="5">Week 5</option>
+            </select>
+
+            <button id="fetch-button" class="w-full p-2 sm:p-3 bg-gradient-to-r from-teal-500 to-blue-600 text-white font-semibold rounded-lg shadow-md transition-transform transform hover:scale-105 active:scale-95 focus:outline-none focus:ring-2 focus:ring-teal-500 text-sm sm:text-base">
+                Load Words
+            </button>
+        </div>
+
+        <!-- Display area for the filtered words -->
+        <div id="words-display" class="mt-4 sm:mt-6">
+            <!-- Words will be displayed here -->
+        </div>
+    </div>
+
+    <script>
+        // --- Global Variables and Helper Functions ---
+        const SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSRRPkYAkjWZbsNUygXwy6r1w-YuQV0S92g2TD_3up0inhx5a3k7Kqu8YJApBv6Rm-vvjEzY-WmzY0g/pub?output=csv";
+        const wordsDisplay = document.getElementById('words-display');
+        let showSpellingForWord = null; // Tracks which word's spelling is currently visible
+        let isTtsPlaying = false; // Prevents multiple sounds from playing at once
+
+        // Helper function to convert base64 to ArrayBuffer
+        const base64ToArrayBuffer = (base64) => {
+          const binaryString = atob(base64);
+          const len = binaryString.length;
+          const bytes = new Uint8Array(len);
+          for (let i = 0; i < len; i++) {
+            bytes[i] = binaryString.charCodeAt(i);
+          }
+          return bytes.buffer;
+        };
+
+        // Helper function to convert PCM data to a WAV Blob
+        const pcmToWav = (pcmData, sampleRate) => {
+          const numberOfChannels = 1;
+          const bitsPerSample = 16;
+          const pcm16 = new Int16Array(pcmData);
+          const dataLength = pcm16.length * 2;
+          const buffer = new ArrayBuffer(44 + dataLength);
+          const view = new DataView(buffer);
+          let offset = 0;
+          
+          function writeString(view, offset, string) {
+            for (let i = 0; i < string.length; i++) {
+              view.setUint8(offset + i, string.charCodeAt(i));
+            }
+          }
+
+          writeString(view, offset, 'RIFF'); offset += 4;
+          view.setUint32(offset, 36 + dataLength, true); offset += 4;
+          writeString(view, offset, 'WAVE'); offset += 4;
+          writeString(view, offset, 'fmt '); offset += 4;
+          view.setUint32(offset, 16, true); offset += 4;
+          view.setUint16(offset, 1, true); offset += 2;
+          view.setUint16(offset, numberOfChannels, true); offset += 2;
+          view.setUint32(offset, sampleRate, true); offset += 4;
+          view.setUint32(offset, sampleRate * numberOfChannels * (bitsPerSample / 8), true); offset += 4;
+          view.setUint16(offset, numberOfChannels * (bitsPerSample / 8), true); offset += 2;
+          view.setUint16(offset, bitsPerSample, true); offset += 2;
+          writeString(view, offset, 'data'); offset += 4;
+          view.setUint32(offset, dataLength, true); offset += 4;
+
+          let pcmOffset = 0;
+          for (let i = 0; i < pcm16.length; i++) {
+            view.setInt16(offset + pcmOffset, pcm16[i], true);
+            pcmOffset += 2;
+          }
+          return new Blob([view], { type: 'audio/wav' });
+        };
+
+        // A utility function to introduce a delay
+        const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+        
+        // New utility function to fetch with retry and exponential backoff
+        const fetchWithRetry = async (url, options, retries = 5) => {
+            for (let i = 0; i < retries; i++) {
+                try {
+                    const response = await fetch(url, options);
+                    if (response.ok) {
+                        return response;
+                    } else if (response.status === 429 && i < retries - 1) { // 429 Too Many Requests
+                        const delay = Math.pow(2, i) * 1000; // Exponential backoff
+                        console.warn(`Request failed with status ${response.status}. Retrying in ${delay / 1000}s...`);
+                        await new Promise(res => setTimeout(res, delay));
+                    } else {
+                        throw new Error(`Fetch failed with status: ${response.status}`);
+                    }
+                } catch (error) {
+                    if (i < retries - 1) {
+                        const delay = Math.pow(2, i) * 1000;
+                        console.warn(`Fetch failed. Retrying in ${delay / 1000}s...`);
+                        await new Promise(res => setTimeout(res, delay));
+                    } else {
+                        throw error;
+                    }
+                }
+            }
+            throw new Error("Maximum retries exceeded.");
+        };
+
+        // Function to play a single piece of text using the Gemini TTS API
+        // This function now throws errors instead of handling them, so the caller can manage the UI state.
+        const playText = async (text) => {
+            const payload = {
+                contents: [{
+                    parts: [{ text: text }]
+                }],
+                generationConfig: {
+                    responseModalities: ["AUDIO"],
+                    speechConfig: {
+                        voiceConfig: { prebuiltVoiceConfig: { voiceName: "Puck" } }
+                    }
+                },
+                model: "gemini-2.5-flash-preview-tts"
+            };
+            const apiKey = "";
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=${apiKey}`;
+            
+            const response = await fetchWithRetry(apiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            
+            const result = await response.json();
+            
+            // Check for the expected response structure and log the full result on failure
+            const part = result?.candidates?.[0]?.content?.parts?.[0];
+            if (!part) {
+                console.error("API Response was malformed or empty:", result);
+                throw new Error("Invalid audio data from TTS API: Malformed or empty response.");
+            }
+            const audioData = part?.inlineData?.data;
+            const mimeType = part?.inlineData?.mimeType;
+
+            if (audioData && mimeType && mimeType.startsWith("audio/")) {
+                const sampleRateMatch = mimeType.match(/rate=(\d+)/);
+                const sampleRate = sampleRateMatch ? parseInt(sampleRateMatch[1], 10) : 24000;
+                const pcmData = base64ToArrayBuffer(audioData);
+                const wavBlob = pcmToWav(pcmData, sampleRate);
+                const audioUrl = URL.createObjectURL(wavBlob);
+                const audio = new Audio(audioUrl);
+                
+                return new Promise((resolve) => {
+                    audio.onended = resolve;
+                    audio.play();
+                });
+            } else {
+                throw new Error("Invalid audio data from TTS API.");
+            }
+        };
+        
+        // Function to play the spelling of a word
+        const playSpelling = async (word) => {
+            const letters = word.split('');
+            for (const letter of letters) {
+                // Increased delay to avoid API call throttling
+                await playText(`Say the letter: ${letter}`);
+                await delay(1000); 
+            }
+        };
+
+        // --- Main App Logic ---
+
+        // Function to process and filter the CSV data
+        const processData = (csvText, month, week) => {
+            const lines = csvText.trim().split('\n');
+            const dataLines = lines.slice(1);
+            const filteredWords = [];
+            
+            for (const line of dataLines) {
+                const [rowMonth, rowWeek, rowVocabs] = line.split(',');
+                
+                if (rowMonth && rowMonth.trim() === month && rowWeek && rowWeek.trim() === week) {
+                    const vocabs = rowVocabs.split(';');
+                    for (const word of vocabs) {
+                        const trimmedWord = word.trim();
+                        if (trimmedWord) {
+                            filteredWords.push(trimmedWord);
+                        }
+                    }
+                }
+            }
+            return filteredWords;
+        };
+
+        // New function to render the words, including spelling
+        const renderWords = (words) => {
+            wordsDisplay.innerHTML = '';
+            const ul = document.createElement('ul');
+            ul.className = 'space-y-2';
+            
+            words.forEach(word => {
+                const li = document.createElement('li');
+                li.className = 'bg-gray-700 p-3 rounded-lg shadow-md cursor-pointer transition-transform transform hover:scale-105 active:scale-95';
+                li.innerHTML = `
+                    <div class="flex items-center justify-between">
+                        <p class="text-xl font-medium text-blue-300 capitalize">${word}</p>
+                        <div class="loading-spinner-${word} hidden">
+                            <svg class="animate-spin h-6 w-6 text-teal-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                            </svg>
+                        </div>
+                        <div class="speaker-icon-${word} block">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-gray-400 hover:text-teal-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M15.536 8.464a5 5 0 010 7.072m2.546-9.106a9 9 0 010 12.728M10 11a2 2 0 11-4 0 2 2 0 014 0z" />
+                            </svg>
+                        </div>
+                    </div>
+                    ${showSpellingForWord === word ? `
+                        <div class="mt-2 p-2 bg-gray-600 rounded-md text-gray-200">
+                            <p class="font-mono">${word.split('').join(' ')}</p>
+                        </div>
+                    ` : ''}
+                `;
+                
+                li.addEventListener('click', async () => {
+                    // This flag prevents new audio requests while one is already playing.
+                    if (isTtsPlaying) return;
+
+                    // Start the audio playback sequence.
+                    isTtsPlaying = true;
+                    const spinner = document.querySelector(`.loading-spinner-${word}`);
+                    const icon = document.querySelector(`.speaker-icon-${word}`);
+                    
+                    try {
+                        spinner.classList.remove('hidden');
+                        icon.classList.add('hidden');
+                        
+                        // Toggle spelling visibility
+                        if (showSpellingForWord === word) {
+                            showSpellingForWord = null;
+                            renderWords(words);
+                        } else {
+                            showSpellingForWord = word;
+                            renderWords(words);
+                            // Play the word immediately, with no delay
+                            await playText(`Say the word: ${word}`);
+                            await playSpelling(word);
+                        }
+                    } catch (error) {
+                        console.error("Error in word/spelling sequence:", error);
+                        // Display a user-friendly error message
+                        const messageBox = document.createElement('div');
+                        messageBox.className = 'fixed inset-0 flex items-center justify-center bg-black bg-opacity-75 z-50';
+                        messageBox.innerHTML = `
+                          <div class="bg-gray-800 p-6 rounded-lg shadow-xl text-center text-red-400">
+                            <p class="mb-4">Failed to play pronunciation. Please try again.</p>
+                            <button class="bg-red-500 hover:bg-red-600 text-white font-semibold py-2 px-4 rounded-lg" onclick="this.parentElement.parentElement.remove()">OK</button>
+                          </div>
+                        `;
+                        document.body.appendChild(messageBox);
+                    } finally {
+                        // Reset the state and hide the spinner
+                        isTtsPlaying = false;
+                        spinner.classList.add('hidden');
+                        icon.classList.remove('hidden');
+                    }
+                });
+                
+                ul.appendChild(li);
+            });
+            
+            wordsDisplay.appendChild(ul);
+        };
+
+        // Event listener for the main fetch button
+        document.getElementById('fetch-button').addEventListener('click', async () => {
+            wordsDisplay.innerHTML = '<p class="text-center text-teal-400">Loading words...</p>';
+            try {
+                const response = await fetch(SPREADSHEET_URL);
+                if (!response.ok) { throw new Error('Network response was not ok'); }
+                const csvText = await response.text();
+                const selectedMonth = document.getElementById('month-select').value;
+                const selectedWeek = document.getElementById('week-select').value;
+                const filteredWords = processData(csvText, selectedMonth, selectedWeek);
+                
+                if (filteredWords.length > 0) {
+                    renderWords(filteredWords);
+                } else {
+                    wordsDisplay.innerHTML = '<p class="text-center text-gray-400">No words found for this selection.</p>';
+                }
+            } catch (error) {
+                console.error("Failed to fetch data:", error);
+                wordsDisplay.innerHTML = '<p class="text-center text-red-400">Error fetching data. Please check the URL.</p>';
+            }
+        });
+    </script>
+</body>
+</html>
